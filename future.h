@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 using tl::expected;
+using tl::unexpected;
 namespace cvk{
 
 template<typename T>
@@ -52,7 +53,7 @@ public:
         other.state = nullptr;
     }
    
-    void subscribe(std::function<void(expected<T,std::exception_ptr>&&)>callback, const asio::io_context& context) noexcept{
+    void subscribe(std::function<void(expected<T,std::exception_ptr>&&)>callback, asio::io_context& context){
         if(not state){throw std::logic_error("use moved future");}
         std::unique_lock lock(state->mutex);
         if(state->used){throw std::logic_error("future use second time");}
@@ -94,7 +95,7 @@ class promise{
         assert(state->valid);
         assert(state->context);
         assert(state->callback);
-        asio::post(state->context,[callback = std::move(state->callback), expected = std::move(state->expected)](){
+        asio::post(*state->context,[callback = std::move(state->callback), expected = std::move(state->expected)]() mutable{
             callback(std::move(expected));
         });
     }
@@ -123,7 +124,7 @@ public:
         if(not state){throw std::logic_error("use moved promise");}
         std::unique_lock lock(state->mutex);
         if (state->valid) throw std::logic_error("value or exception already set");
-        state->expected = tl::unexpected<std::exception_ptr>(std::move(exc)); 
+        state->expected = ::unexpected<std::exception_ptr>(std::move(exc)); 
         state->valid = true;
         invoke_Callback();
         state->cond_var.notify_one();
@@ -136,7 +137,7 @@ public:
         if(not state){return;}
         std::unique_lock lock(state->mutex);
         if(not state->valid){
-            state->expected = std::make_exception_ptr(std::logic_error("promise value or exception not setted"));
+            state->expected = ::unexpected<std::exception_ptr>(std::make_exception_ptr(std::logic_error("promise value or exception not setted")));
             state->valid = true;
             // ? notify only if future alive
             state->cond_var.notify_one();
@@ -149,3 +150,67 @@ public:
     }
 };
 }
+
+#include <coroutine>
+
+template <cvk::FutureValue T, typename... Args>
+struct std::coroutine_traits<cvk::future<T>, Args...>
+{
+    struct promise_type : cvk::promise<T>{
+        cvk::future<T> get_return_object() noexcept
+        {
+            return this->get_future();
+        }
+ 
+        std::suspend_never initial_suspend() const noexcept { return {}; }
+        std::suspend_never final_suspend() const noexcept { return {}; }
+
+            // ? only move return value
+        void return_value(T&& value) noexcept(std::is_nothrow_move_constructible_v<T>)
+        {
+            this->set_value(std::move(value));
+        }
+ 
+        void unhandled_exception() noexcept
+        {
+            this->set_exception(std::current_exception());
+        }
+    };
+};
+
+template <cvk::FutureValue T>
+struct FutureAwaiter{
+
+    template<class io_context, class F, typename... Args>
+requires std::is_invocable_r<cvk::future<T>, F, Args...>::value
+    and (std::is_same_v<asio::io_context,std::remove_pointer_t<io_context>>
+        or std::is_same_v<asio::io_context, std::remove_reference_t<io_context>>
+    )
+    FutureAwaiter(io_context& context, F&& func, Args... args)
+    :future(func(std::forward<Args>(args)...))
+    {
+        if constexpr(std::is_same_v<asio::io_context, std::remove_reference_t<io_context>>){
+            this->context = &context;
+        }else{
+            this->context = context;
+        }
+    }
+    bool await_ready()noexcept{return false;}
+    void await_suspend(std::coroutine_handle<>cont){
+        future.subscribe([this,cont](expected<T,std::exception_ptr>&& expected){
+            result = std::move(expected);
+            cont();
+        }, *context);
+    }
+    T await_resume(){
+        if(result.has_value()){
+            return std::move(result.value());
+        }
+        std::rethrow_exception(result.error());
+    }
+
+private:
+    cvk::future<T> future;
+    expected<T,std::exception_ptr> result;
+    asio::io_context* context = nullptr;
+};
